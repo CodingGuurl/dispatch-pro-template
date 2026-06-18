@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from supabase import create_client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 GROUPE_AGENTS_TERRAIN_ID = int(os.getenv("GROUPE_TERRAIN_ID", "0"))
 NOM_ENTREPRISE = os.getenv("NOM_ENTREPRISE", "Dispatch")
 NOM_UNITE = os.getenv("NOM_UNITE", "Tache")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+RELANCE_MINUTES = int(os.getenv("RELANCE_MINUTES", "30"))
 
-# Etapes personnalisables par client. Format: "Etape1,Etape2,Etape3"
 STEPS_RAW = os.getenv("STEPS", "En route,En cours")
 STEPS = [s.strip() for s in STEPS_RAW.split(",") if s.strip()]
 
@@ -33,20 +34,119 @@ async def set_bot_commands(app: Application):
 async def error_handler(update, context):
     logger.error("Erreur: %s", context.error)
 
+def get_utilisateur(user_id):
+    result = supabase.table("utilisateurs").select("*").eq("user_id", user_id).execute()
+    if result.data:
+        return result.data[0]
+    return None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text(f"ID de ce groupe : {update.effective_chat.id}")
         return
+
+    user_id = update.effective_user.id
+    nom = update.effective_user.first_name or "Utilisateur"
+
+    utilisateur = get_utilisateur(user_id)
+
+    if utilisateur and utilisateur["statut"] == "approuve":
+        await update.message.reply_text(
+            f"🤖 Bot {NOM_ENTREPRISE} actif.\n\n"
+            f"Envoyez les details de la {NOM_UNITE.lower()} ici.\n\n"
+            f"Commandes:\n"
+            f"/taches - Voir les taches en attente"
+        )
+        return
+
+    if utilisateur and utilisateur["statut"] == "en_attente":
+        await update.message.reply_text(
+            "⏳ Votre demande est en cours de validation. Vous serez notifie."
+        )
+        return
+
+    if utilisateur and utilisateur["statut"] == "refuse":
+        await update.message.reply_text(
+            "❌ Votre demande a ete refusee. Contactez l'administrateur."
+        )
+        return
+
+    supabase.table("utilisateurs").insert({
+        "user_id": user_id,
+        "nom": nom,
+        "statut": "en_attente",
+        "role": None
+    }).execute()
+
     await update.message.reply_text(
-        f"🤖 Bot {NOM_ENTREPRISE} actif.\n\n"
-        f"Envoyez les details de la {NOM_UNITE.lower()} ici.\n\n"
-        f"Commandes:\n"
-        f"/taches - Voir les taches en attente"
+        "⏳ Bienvenue! Votre demande d'acces a ete envoyee a l'administrateur.\n\n"
+        "Vous serez notifie une fois valide."
     )
+
+    if ADMIN_ID:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Approuver - Agent", callback_data=f"approve_agent_{user_id}")],
+            [InlineKeyboardButton("✅ Approuver - Executant", callback_data=f"approve_executant_{user_id}")],
+            [InlineKeyboardButton("❌ Refuser", callback_data=f"refuse_{user_id}")]
+        ])
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🆕 Nouvelle demande d'acces\n\nNom: {nom}\nID: {user_id}\n\nChoisir un role:",
+            reply_markup=keyboard
+        )
+
+async def gerer_validation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Vous n'etes pas autorise.", show_alert=True)
+        return
+
+    data = query.data
+
+    if data.startswith("refuse_"):
+        user_id = int(data.split("_")[1])
+        supabase.table("utilisateurs").update({"statut": "refuse"}).eq("user_id", user_id).execute()
+        await query.edit_message_text(f"❌ Demande refusee pour l'utilisateur {user_id}")
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ Votre demande a ete refusee."
+            )
+        except Exception:
+            pass
+        return
+
+    if data.startswith("approve_agent_"):
+        user_id = int(data.split("_")[2])
+        role = "agent"
+    elif data.startswith("approve_executant_"):
+        user_id = int(data.split("_")[2])
+        role = "executant"
+    else:
+        return
+
+    supabase.table("utilisateurs").update({"statut": "approuve", "role": role}).eq("user_id", user_id).execute()
+    await query.edit_message_text(f"✅ Utilisateur {user_id} approuve comme {role}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Votre demande a ete approuvee en tant que {role}!\n\nVous pouvez maintenant utiliser le bot. Tapez /start"
+        )
+    except Exception:
+        pass
 
 async def liste_taches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
+
+    utilisateur = get_utilisateur(update.effective_user.id)
+    if not utilisateur or utilisateur["statut"] != "approuve":
+        await update.message.reply_text("⏳ Vous n'etes pas encore autorise. Tapez /start")
+        return
+
     result = supabase.table("tasks").select("*").eq("statut", "libre").execute()
     if not result.data:
         await update.message.reply_text("✅ Aucune tache en attente.")
@@ -64,6 +164,15 @@ async def recevoir_tache(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await recevoir_rendu(update, context)
         return
 
+    utilisateur = get_utilisateur(update.effective_user.id)
+    if not utilisateur or utilisateur["statut"] != "approuve":
+        await update.message.reply_text("⏳ Vous n'etes pas encore autorise a utiliser ce bot. Tapez /start")
+        return
+
+    if utilisateur["role"] != "agent":
+        await update.message.reply_text("❌ Seuls les agents peuvent publier des taches.")
+        return
+
     texte = update.message.text
     agent_nom = update.effective_user.first_name or "Agent"
     agent_id = update.effective_user.id
@@ -75,7 +184,8 @@ async def recevoir_tache(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "agent_id": agent_id,
         "texte": texte,
         "statut": "libre",
-        "etape_index": -1
+        "etape_index": -1,
+        "relance_envoyee": False
     }).execute()
 
     task_id = result.data[0]["id"]
@@ -128,7 +238,6 @@ async def maj_notif_agent(context, task, statut_texte):
         logger.warning(f"Impossible d'editer le message agent: {e}")
 
 def get_keyboard_pour_etape(task_id, etape_index):
-    """Genere le bouton pour passer a l'etape suivante, ou les boutons finaux."""
     if etape_index + 1 < len(STEPS):
         prochaine_etape = STEPS[etape_index + 1]
         return InlineKeyboardMarkup([
@@ -146,6 +255,11 @@ async def prendre_tache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = int(query.data.split("_")[1])
     executant = query.from_user.first_name or "Agent"
     executant_id = query.from_user.id
+
+    utilisateur = get_utilisateur(executant_id)
+    if not utilisateur or utilisateur["statut"] != "approuve" or utilisateur["role"] != "executant":
+        await query.answer("Vous n'etes pas autorise a prendre des taches. Tapez /start en prive avec le bot.", show_alert=True)
+        return
 
     result = supabase.table("tasks").select("*").eq("id", task_id).execute()
     if not result.data:
@@ -305,12 +419,47 @@ async def recevoir_rendu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"⚠️ Probleme sur {NOM_UNITE} #{task_id} signale par {executant}:\n{texte}"
             )
 
+async def verifier_relances(context: ContextTypes.DEFAULT_TYPE):
+    """Job qui tourne periodiquement pour relancer les agents sur les taches non prises."""
+    seuil = datetime.now(timezone.utc) - timedelta(minutes=RELANCE_MINUTES)
+
+    result = supabase.table("tasks").select("*").eq("statut", "libre").eq("relance_envoyee", False).execute()
+
+    for task in result.data:
+        created_at_str = task.get("created_at")
+        if not created_at_str:
+            continue
+        try:
+            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        if created_at < seuil:
+            agent_id = task.get("agent_id")
+            if agent_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=agent_id,
+                        text=(
+                            f"⏰ Personne n'a encore pris votre {NOM_UNITE.lower()} "
+                            f"depuis plus de {RELANCE_MINUTES} minutes.\n\n{task['texte']}"
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Impossible de notifier l'agent {agent_id}: {e}")
+
+            supabase.table("tasks").update({"relance_envoyee": True}).eq("id", task["id"]).execute()
+
 def register_handlers(app: Application):
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("taches", liste_taches))
+    app.add_handler(CallbackQueryHandler(gerer_validation, pattern=r"^approve_|^refuse_"))
     app.add_handler(CallbackQueryHandler(prendre_tache, pattern=r"^prendre_"))
     app.add_handler(CallbackQueryHandler(annuler_tache, pattern=r"^annuler_"))
     app.add_handler(CallbackQueryHandler(avancer_etape, pattern=r"^etape_"))
     app.add_handler(CallbackQueryHandler(valider_tache, pattern=r"^done_|^probleme_"))
     app.add_handler(MessageHandler(filters.PHOTO, recevoir_rendu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, recevoir_tache))
+
+    if app.job_queue:
+        app.job_queue.run_repeating(verifier_relances, interval=300, first=60)
